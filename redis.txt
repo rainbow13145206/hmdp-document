@@ -1,0 +1,289 @@
+﻿        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.7.17</version>
+        </dependency>
+hutool工具类    ：
+String code = RandomUtil.randomNumbers(6);//生成6位的随机数字    RandomUtil.randomString(8);生成随机字符串
+
+cacheCode==null session可能过期了     response.setStatus(401);设置状态码  
+
+//3.使用reids保存 login:code:phone,为了防止用户一直点击重新发送
+ stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY, phone,2, TimeUnit.MINUTES);
+ String uuid = UUID.randomUUID().toString(true); 不用-连接的字符串
+
+//由于用的是stringredistemplate,所以key，value必须是字符串  entity->map
+Map<String, Object> map = BeanUtil.beanToMap(userDTO, new HashMap<>()
+                , CopyOptions.create().setIgnoreNullValue(true).setFieldValueEditor((key, value) -> value.toString()));
+
+//将map->entity  hutool工具类
+UserDTO userDTO = BeanUtil.fillBeanWithMap(userDTOMap, new UserDTO(), false);
+
+ Shop shop = JSONUtil.toBean((JSONObject) redisData.getData(), Shop.class);//因为getData是object类型
+
+//跟新redis中的数据有效期
+ redisTemplate.expire(key, LOGIN_USER_TTL, TimeUnit.MINUTES);
+
+StrUtil.isNotBlank(shopString) 不为空    Shop shop = JSONUtil.toBean(shopString, Shop.class);     BooleanUtil.isTrue(setIfAbsent);//自动拆箱
+
+List<ShopType> shopTypes = JSONUtil.toList(shopTypeList, ShopType.class);	JSONUtil.toJsonStr(shopTypes)
+
+1.缓存穿透 ：缓存穿透是指客户端请求的数据在缓存中和数据库中都不存在，这样缓存永远不会生效，这些请求都会打到数据库。从而给数据造成压力
+根据id查询店铺时，如果缓存未命中，则查询数据库，将数据库结果写入缓存，并设置超时时间   根据id修改店铺时，先修改数据库，再删除缓存
+
+**缓存空对象思路分析：**当我们客户端访问不存在的数据时，先请求redis，但是此时redis中没有数据，此时会访问到数据库，但是数据库中也没有数据，这个数据穿透了缓存，直击数据库，
+我们都知道数据库能够承载的并发不如redis这么高，如果大量的请求同时过来访问这种不存在的数据，这些请求就都会访问到数据库，简单的解决方案就是哪怕这个数据在数据库中也不存在，
+我们也把这个数据存入到redis中去，这样，下次用户过来访问这个不存在的数据，那么在redis中也能找到这个数据就不会进入到缓存了
+
+**布隆过滤：**布隆过滤器其实采用的是哈希思想来解决这个问题，通过一个庞大的二进制数组，走哈希思想去判断当前这个要查询的这个数据是否存在，如果布隆过滤器判断存在，则放行，
+这个请求会去访问redis，哪怕此时redis中的数据过期了，但是数据库中一定存在这个数据，在数据库中查询出来这个数据后，再将其放入到redis中，假设布隆过滤器判断这个数据不存在，
+则直接返回 这种方式优点在于节约内存空间，存在误判，误判原因在于：布隆过滤器走的是哈希思想，只要哈希思想，就可能存在哈希冲突
+
+2.缓存雪崩是指在同一时段大量的缓存key同时失效或者Redis服务宕机，导致大量请求到达数据库，带来巨大压力。
+* 给不同的Key的TTL添加随机值
+* 利用Redis集群提高服务的可用性
+* 给缓存业务添加降级限流策略
+* 给业务添加多级缓存
+
+3.缓存击穿问题也叫热点Key问题，就是一个被高并发访问并且缓存重建业务较复杂的key突然失效了，无数的请求访问会在瞬间给数据库带来巨大的冲击。
+* 互斥锁
+* 逻辑过期
+逻辑分析：假设线程1在查询缓存之后，本来应该去查询数据库，然后把这个数据重新加载到缓存的，此时只要线程1走完这个逻辑，其他线程就都能从缓存中加载这些数据了，
+但是假设在线程1没有走完的时候，后续的线程2，线程3，线程4同时过来访问当前这个方法， 那么这些线程都不能从缓存中查询到数据，那么他们就会同一时刻来访问查询缓存，
+都没查到，接着同一时间去访问数据库，同时的去执行数据库代码，对数据库访问压力过大
+解决方案二、逻辑过期方案
+方案分析：我们之所以会出现这个缓存击穿问题，主要原因是在于我们对key设置了过期时间，假设我们不设置过期时间，其实就不会有缓存击穿的问题，但是不设置过期时间，
+这样数据不就一直占用我们内存了吗，我们可以采用逻辑过期方案。我们把过期时间设置在 redis的value中，注意：这个过期时间并不会直接作用于redis，而是我们后续通过逻辑去处理。
+假设线程1去查询缓存，然后从value中判断出来当前的数据已经过期了，此时线程1去获得互斥锁，那么其他线程会进行阻塞，获得了锁的线程他会开启一个 线程去进行 以前的重构数据的逻辑，
+直到新开的线程完成这个逻辑后，才释放锁， 而线程1直接进行返回，假设现在线程3过来访问，由于线程线程2持有着锁，所以线程3无法获得锁，线程3也直接返回数据，
+只有等到新开的线程2把重建数据构建完后，其他线程才能走返回正确的数据。这种方案巧妙在于，异步的构建缓存，缺点在于在构建完缓存之前，返回的都是脏数据。
+
+private static final ExecutorService EXECUTOR_SERVICE= Executors.newFixedThreadPool(10);//创建线程池
+
+expireTime.isAfter(LocalDateTime.now()) //判断是否过期
+
+RedisData redisData = JSONUtil.toBean(shopString, RedisData.class); 
+Shop shop = JSONUtil.toBean((JSONObject) redisData.getData(), Shop.class);//因为getData是object类型
+
+/**
+     * 根据指定的key查询缓存，并反序列化为指定类型，利用缓存空值的方式解决缓存穿透问题/使用互斥锁解决击穿问题
+     * Function<ID, R> dbFallback  ID为参数，R为返回值
+     *
+     * @param id         商品id
+     * @param type       实体类型
+     * @param keyPrefix  键的前缀
+     * @param dbFallback 函数
+     * @param time       时间
+     * @param timeUnit   时间类型
+     * @param <R>        泛型
+     * @param <ID>       泛型
+     * @return
+     */
+    public <R, ID> R getShopByLock(ID id, Class<R> type, String keyPrefix, Function<ID, R> dbFallback, Long time, TimeUnit timeUnit) {
+        String key = keyPrefix + id;
+        //从reids中查询
+        String json = stringRedisTemplate.opsForValue().get(key);
+        //命中的话直接返回数据
+        if (StrUtil.isNotBlank(json)) {
+            return JSONUtil.toBean(json, type);
+        }
+        //=======穿透============
+        //没有数据要么数据为空，要么为“ ”,防止缓存穿透
+        if (json != null) {
+            //那么可能是恶意数据""
+            return null;
+        }
+        //=======穿透============
+
+        //=======缓存击穿=========
+        //redis未命中的话获取锁
+        boolean lock = getLock(RedisConstants.LOCK_SHOP_KEY + id);
+
+        //没有获取锁直接休眠，休眠后重新从redis中获取
+        Shop shop = null;
+        R r = null;
+        try {
+            if (!lock) {
+                Thread.sleep(50);
+                return getShopByLock(id, type, keyPrefix, dbFallback, time, timeUnit);
+            }
+            //获取到锁了从数据库查询
+            //=======缓存击穿=========
+            //===========================================以下是数据库查询============================================
+            //2 没有的话查询数据库
+            r = dbFallback.apply(id);
+            //2.2 没有的话返回错误信息
+            if (r == null) {
+                //将空的数据保存到redis，防止恶意访问给数据库造成压力,加上随机ttl是为了防止缓存雪崩，防止同一时间内大量key过期
+                stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL + RandomUtil.randomLong(5), timeUnit);
+                return null;
+            }
+            //2.1 数据库中有的话保存到redis中，并返回
+            this.set(key, r, time, timeUnit);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } finally {
+            unLock(RedisConstants.LOCK_SHOP_KEY + id);
+        }
+        return r;
+    }
+
+
+
+/**
+     * 基于redis缓存查询数据库
+     * @param id
+     * @return
+     */
+    @Override
+    public Result getByIdByRedis(Long id) {
+        Shop shop = cacheUtils.getShopByLock(id, Shop.class, CACHE_SHOP_KEY, id2 ->
+                        getById(id2)
+                , RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        if (shop == null) {
+            return Result.fail("店铺不存在");
+        }
+        return Result.ok(shop);
+    }
+
+
+/**
+     * 根据指定的key查询缓存，并反序列化为指定类型，需要利用逻辑过期解决缓存击穿问题
+     *
+     * @param id
+     * @param type
+     * @param keyPrefix
+     * @param dbFallback
+     * @param time
+     * @param timeUnit
+     * @param <R>
+     * @param <ID>
+     * @return
+     */
+    public <R, ID> R getShopByExpire(ID id, Class<R> type, String keyPrefix, Function<ID, R> dbFallback, Long time, TimeUnit timeUnit) {
+        String key = keyPrefix + id;
+        //从reids中查询
+        String json = stringRedisTemplate.opsForValue().get(key);
+        //未命中之直接返回
+        if (StrUtil.isBlank(json)) {
+            return null;
+        }
+        //命中的话判断缓存是否过期
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        R r = JSONUtil.toBean((JSONObject) redisData.getData(), type);//因为getData是object类型
+        LocalDateTime expireTime = redisData.getExpireTime();
+        //未过期返回
+        if (expireTime.isAfter(LocalDateTime.now())) {
+            return r;
+        }
+        //过期了就获取互斥锁
+        boolean lock = getLock(RedisConstants.LOCK_SHOP_KEY + id);
+        //判断是否获取锁
+        //否的话返回旧数据
+        if (!lock) {
+            return r;
+        }
+        //获取锁开启另外一条线程查询数据库重建redis缓存，并写入redis释放锁
+        if (lock) {
+            EXECUTOR_SERVICE.submit(() -> {
+                try {
+                    //测试
+                    Thread.sleep(1000);
+                    //查询数据库
+                    R newR = dbFallback.apply(id);
+                    //重构redis
+                    setWithLogicalExpire(key, newR, time, timeUnit);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    unLock(RedisConstants.LOCK_SHOP_KEY + id);
+                }
+            });
+        }
+        return r;
+    }
+
+LocalDateTime localDateTime = LocalDateTime.of(2022, 1, 1, 0, 0, 0);   long second = localDateTime.toEpochSecond(ZoneOffset.UTC);//生成时间戳
+String format = now.format( DateTimeFormatter.ofPattern("yy:MM:dd"));//now LocalDateTime类型
+Long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + format);//统计key值生成的个数
+
+countdownlatch名为信号枪：主要的作用是同步协调在多线程的等待于唤醒问题
+
+我们如果没有CountDownLatch ，那么由于程序是异步的，当异步程序没有执行完时，主线程就已经执行完了，然后我们期望的是分线程全部走完之后，主线程再走，所以我们此时需要使用到CountDownLatch
+CountDownLatch 中有两个最重要的方法
+1、countDown
+2、await
+await 方法 是阻塞方法，我们担心分线程没有执行完时，main线程就先执行，所以使用await可以让main线程阻塞，那么什么时候main线程不再阻塞呢？当CountDownLatch  内部维护的 变量变为0时，
+就不再阻塞，直接放行，那么什么时候CountDownLatch   维护的变量变为0 呢，我们只需要调用一次countDown ，内部变量就减少1，我们让分线程和变量绑定， 执行完一个分线程就减少一个变量，
+当分线程全部走完，CountDownLatch 维护的变量就是0，此时await就不再阻塞，统计出来的时间也就是所有分线程执行完后的时间。
+
+
+private ExecutorService executorService = Executors.newFixedThreadPool(300);
+    @Test
+    public void testRedisIdWord() throws InterruptedException {
+        CountDownLatch countDownLatch = new CountDownLatch(300);
+        Runnable runnable = () -> {//生成id
+            for (int i = 0; i < 100; i++) {
+                Long orderId = redisIdWork.nextId("order");
+                System.out.println(orderId);
+            }
+            countDownLatch.countDown();//每次执行完一个线程就减一
+        };
+        Long begin = System.currentTimeMillis();
+        for (int i = 0; i < 300; i++) {//当线程池在执行时，可能会向下执行main线程，所以先阻塞
+            executorService.submit(runnable);
+        }
+        countDownLatch.await();//阻塞main线程
+        Long end = System.currentTimeMillis();
+        System.out.println("time=" + (end - begin));
+    }
+
+
+优惠券超卖问题：假设线程1过来查询库存，判断出来库存大于1，正准备去扣减库存，但是还没有来得及去扣减，此时线程2过来，线程2也去查询库存，发现这个数量一定也大于1，
+那么这两个线程都会去扣减库存，最终多个线程相当于一起去扣减库存，此时就会出现库存的超卖问题。
+**悲观锁：**
+ 悲观锁可以实现对于数据的串行化执行，比如syn，和lock都是悲观锁的代表，同时，悲观锁中又可以再细分为公平锁，非公平锁，可重入锁，等等
+**乐观锁：**
+  乐观锁：会有一个版本号，每次操作数据会对版本号+1，再提交回数据时，会去校验是否比之前的版本大1 ，如果大1 ，则进行操作成功，这套机制的核心逻辑在于，如果在操作过程中，版本号只比原来大1 ，
+那么就意味着操作过程中没有人对他进行过修改，他的操作就是安全的，如果不大1，则数据被修改过，当然乐观锁还有一些变种的处理方式比如cas
+  乐观锁的典型代表：就是cas，利用cas进行无锁化机制加锁，var5 是操作前读取的内存值，while中的var1+var2 是预估值，如果预估值 == 内存值，则代表中间没有被人修改过，此时就将新值去替换 内存值
+
+在我跟新的时候查看库存（取代版本号）是否大于零，如果大于零，我就可以修改。其他线程也是一样。
+ //减少秒杀代金券库存
+        boolean sucess = iSeckillVoucherService.update()
+                .setSql("stock=stock-1")//set stock=stock-1
+                .eq("voucher_id", voucherId)//where voucher_id=?
+                .gt("stock", 0)//where stock>0  避免线程安全问题
+                .update();
+
+//intern() 这个方法是从常量池中拿到数据，如果我们直接使用userId.toString() 他拿到的对象实际上是不同的对象，new出来的对象，我们使用锁必须保证锁必须是同一把，所以我们需要使用intern()方法
+        //在事物执行结束后再释放锁
+        synchronized (userId.toString().intern()) {
+            //依赖
+            //@EnableAspectJAutoProxy(exposeProxy = true)//exposeProxy暴露代理对象,（暴露后可获得代理对象）获取代理对象调用方法，因为底层是代理对象调用方法
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            return proxy.createVoucherOrder(voucherId);
+        }
+
+加锁可以解决在单机情况下的一人一单安全问题，但是在集群模式下就不行了。
+
+分布式锁：满足分布式系统或集群模式下多进程可见并且互斥的锁（redis）。
+分布式锁的核心思想就是让大家都使用同一把锁，只要大家使用的是同一把锁，那么我们就能锁住线程，不让线程进行，让程序串行执行，这就是分布式锁的核心思路
+
+run->edit configuration 新创建一个服务  再vm-options添加配置-Dserver.port=8082  然后在nginx.conf中开启负载均衡，nginx -s reload   这样就创建了两台tomcat
+
+由于线程在执行删除锁的时候由于jvm的垃圾回收机制，可能导致锁过期。Lua是一种编程语言，它的基本语法大家可以参考网站：https://www.runoob.com/lua/lua-tutorial.html，这里重点介绍Redis提供的调用函数，我们可以使用lua去操作redis，又能保证他的原子性，这样就可以实现拿锁比锁删锁是一个原子性动作了
+
+Resource类型 = new ClassPathResource("unlock.lua")；
+
+    //lua脚本的初始化
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
+
+    static {
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
+        UNLOCK_SCRIPT.setResultType(Long.class);
+    }
+Redisson 它不仅提供了一系列的分布式的Java常用对象，还提供了许多分布式服务，其中就包含了各种分布式锁的实现。
+========================================================
+使用redis改善性能
