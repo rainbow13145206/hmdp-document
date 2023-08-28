@@ -287,3 +287,76 @@ Resource类型 = new ClassPathResource("unlock.lua")；
 Redisson 它不仅提供了一系列的分布式的Java常用对象，还提供了许多分布式服务，其中就包含了各种分布式锁的实现。
 ========================================================
 使用redis改善性能
+使用lua脚本记录库存和下单的用户
+--参数变量,java代码传参会根据位置赋值参数
+--优惠券的id
+local voucherId=ARGV[1]
+--用户id
+local userId=ARGV[2]
+--订单id
+local orderId=ARGV[3]
+
+--数据key
+--库存key,lua脚本拼接要使用..
+local stockKey='seckill:stock:'..voucherId
+--订单key
+local orderKey='seckill:order:'..voucherId
+--用户下单key
+local userKey='seckill:user:'..voucherId
+
+--脚本业务
+--判断库存是否充足
+if(tonumber(redis.call('get',stockKey))<=0) then
+    --库存不足返回1
+    return 1
+end
+--判断是否重复下单
+if(redis.call('sismember',userKey,userId)==1) then
+    --如果用户存在，返回2
+    return 2
+end
+--扣减库存
+redis.call('incrby',stockKey,-1)
+--用户第一次下单则要保存，使用set集合
+redis.call('sadd',userKey,userId)
+return 0
+
+
+//定义成员变量
+    IVoucherOrderService iVoucherOrderService=null;
+
+    private static final DefaultRedisScript<Long> DEFAULT_REDIS_SCRIPT;
+    static {
+        DEFAULT_REDIS_SCRIPT=new DefaultRedisScript<>();
+        DEFAULT_REDIS_SCRIPT.setResultType(Long.class);
+        DEFAULT_REDIS_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
+    }
+    //创建阻塞队列，阻塞队列中有东西就会给你，没有的话就会暂停
+    private static final BlockingQueue<VoucherOrder> ordersQueue = new ArrayBlockingQueue<>(1024*1024);
+    //创建单线程池
+    private static final ExecutorService EXECUTOR_SERVICE= Executors.newSingleThreadExecutor();
+    @PostConstruct//当前类初识化完毕执行
+    private void init(){
+        EXECUTOR_SERVICE.submit(new VoucherOrderHandler());
+    }
+    //内部类创建线程任务
+    private class VoucherOrderHandler implements Runnable{
+        @Override
+        public void run() {
+            while (true){
+                //获取队列中的订单
+                VoucherOrder order = null;
+                try {
+                    order = ordersQueue.take();
+                    //创建订单
+                    handleVoucherOrder(order);
+                } catch (Exception e) {
+                    log.error("处理订单异常{}",e);
+                }
+
+            }
+        }
+    }
+
+
+
