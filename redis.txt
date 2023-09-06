@@ -505,3 +505,259 @@ return 0
         save(voucherOrder);
     }
 
+  private String createNewFileName(String originalFilename) {
+        // 获取后缀
+        String suffix = StrUtil.subAfter(originalFilename, ".", true);
+        // 生成目录
+        String name = UUID.randomUUID().toString();
+        int hash = name.hashCode();
+        int d1 = hash & 0xF;
+        int d2 = (hash >> 4) & 0xF;
+        // 判断目录是否存在
+        File dir = new File(SystemConstants.IMAGE_UPLOAD_DIR, StrUtil.format("/blogs/{}/{}", d1, d2));
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        // 生成文件名
+        return StrUtil.format("/blogs/{}/{}/{}.{}", d1, d2, name, suffix);
+    }
+
+@TableField(exist = false)  //用在数据库不存在的实体属性上
+
+
+
+    /**
+     * 查询点赞排名
+     *
+     * @param id
+     * @return
+     */
+    @Override
+    public Result queryLikesRank(Long id) {
+        String key = BLOG_LIKE_KEY + id;
+        //从redis中获取点赞集合
+        Set<String> likesTop5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+        if (likesTop5 == null || likesTop5.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<Long> collectIds = likesTop5.stream().map(Long::valueOf).collect(Collectors.toList());
+        String strIds = StrUtil.join(",",collectIds);
+        //查询用户信息封装成userDTO集合  select * from tb_blog where id in (5,4) order by field(id,5,4);
+        List<UserDTO> userDTOLists = userService.query()
+                .in("id", collectIds).last("order by field(id," + strIds + ")")
+                .list()
+                .stream()
+                .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+                .collect(Collectors.toList());
+        return Result.ok(userDTOLists);
+    }
+
+//求俩个集合的交集，看他们共同关注了谁
+  Set<String> intersectList = stringRedisTemplate.opsForSet().intersect(userKey, followerKey);
+
+滚动分页查询
+    /**
+     * 发布并保存博客笔记
+     *
+     * @param blog
+     * @return
+     */
+    @Override
+    public Result saveBlog(Blog blog) {
+        // 获取登录用户
+        UserDTO user = UserHolder.getUser();
+        blog.setUserId(user.getId());
+        // 保存探店博文
+        boolean isSuccess = blogService.save(blog);
+        if (!isSuccess) {
+            return Result.fail("上传笔记失败");
+        }
+        //查询笔记作者的所有粉丝
+        List<Follow> followersList = iFollowService.query().eq("follow_user_id", user.getId()).list();
+        //推送粉丝id
+        for (Follow follower : followersList) {
+            //获取粉丝id
+            Long userId = follower.getUserId();
+            //推送
+            stringRedisTemplate.opsForZSet().add("feed:" + userId, blog.getId().toString(), System.currentTimeMillis());
+        }
+        // 返回id
+        return Result.ok(blog.getId());
+    }
+
+    /**
+     * 滚动分页查询
+     *
+     * @param max    最下时间戳
+     * @param offset 偏移量
+     * @return
+     */
+    @Override
+    public Result queryFollowBlog(Long max, Integer offset) {
+        //获取用户id
+        Long userId = UserHolder.getUser().getId();
+        String key = "feed:" + userId;
+        //根据用户id执行滚动查询
+        //zrevrangebyscore s 1000 0 withscores limit 0 2 1000：最大分数，0：最小分数， 0：偏移位置 2：偏移个数
+        //zrangebyscore s 0 1000 withscores limit 0 2   正序，zrevrangebyscore 倒序
+        Set<ZSetOperations.TypedTuple<String>> typedTuples = stringRedisTemplate.opsForZSet().
+                reverseRangeByScoreWithScores(key, 0, max, offset, 2);
+        if (typedTuples.isEmpty() || typedTuples == null) {
+            return Result.ok();
+        }
+        //封装到ScrollResult，将数据返回给前端
+        List<Long> ids = new ArrayList<>(typedTuples.size());//博客id的个数
+        long maxStamp = 0L;
+        int os = 1;//从偏移的下一个位置开始滚动
+        for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+            long timeStamp = typedTuple.getScore().longValue();
+            if (maxStamp == timeStamp) {
+                os++;
+            } else {
+                maxStamp = timeStamp;
+                os = 1;
+            }
+
+            ids.add(Long.valueOf(typedTuple.getValue()));
+        }
+        //5 4 3 3 1 2 1.第一轮取出  5 4 3   2.第二轮  3 3 1 2  他会取 3 3 1 偏移位置应该在第二个3中
+        ScrollResult scrollResult = new ScrollResult();
+        String strIds = StrUtil.join(",", ids);
+        List<Blog> blogs = blogService.query().in("id", ids).last("order by field(id," + strIds + ")").list();
+        for (Blog blog : blogs) {
+            //封装参数
+            setBlogUserById(blog);
+            //看该用户是否已经点赞
+            isLiked(blog);
+        }
+        scrollResult.setList(blogs);
+        scrollResult.setOffset(os);
+        scrollResult.setMinTime(maxStamp);
+        return Result.ok(scrollResult);
+    }
+
+GEO就是Geolocation的简写形式，代表地理坐标。Redis在3.2版本中加入了对GEO的支持，允许存储地理坐标信息，帮助我们根据经纬度来检索数据。常见的命令有：
+
+* GEOADD：添加一个地理空间信息，包含：经度（longitude）、纬度（latitude）、值（member）
+* GEODIST：计算指定的两个点之间的距离并返回
+* GEOHASH：将指定member的坐标转为hash字符串形式并返回
+* GEOPOS：返回指定member的坐标
+* GEORADIUS：指定圆心、半径，找到该圆内包含的所有member，并按照与圆心之间的距离排序后返回。6.以后已废弃
+* GEOSEARCH：在指定范围内搜索member，并按照与指定点之间的距离排序后返回。范围可以是圆形或矩形。6.2.新功能
+* GEOSEARCHSTORE：与GEOSEARCH功能一致，不过可以把结果存储到一个指定的key。 6.2.新功能
+
+//查询所有商铺信息
+        List<Shop> list = iShopService.list();
+        //根据商品类型id分类
+        Map<Long, List<Shop>> shopMaps = list.stream().collect(Collectors.groupingBy(Shop::getTypeId));
+        //添加地理坐标
+        for (Map.Entry<Long, List<Shop>> entry : shopMaps.entrySet()) {
+            Long typeId = entry.getKey();//获取商品的类型
+            List<Shop> value = entry.getValue();//获取该类型的一个集合
+            String key = "shop:geo:" + typeId;
+            List<RedisGeoCommands.GeoLocation<String>> locations = new ArrayList<>(value.size());
+            for (Shop shop : value) {
+                //添加商品的id：地理坐标
+                locations.add(new RedisGeoCommands.GeoLocation<>(shop.getId().toString(),
+                        new Point(shop.getX(),
+                                shop.getY())));
+            }
+            stringRedisTemplate.opsForGeo().add(key, locations);
+        }
+    }
+
+签到：
+BitMap的操作命令有：
+
+* SETBIT：向指定位置（offset）存入一个0或1
+* GETBIT ：获取指定位置（offset）的bit值
+* BITCOUNT ：统计BitMap中值为1的bit位的数量
+* BITFIELD ：操作（查询、修改、自增）BitMap中bit数组中的指定位置（offset）的值
+* BITFIELD_RO ：获取BitMap中bit数组，并以十进制形式返回
+* BITOP ：将多个BitMap的结果做位运算（与 、或、异或）
+* BITPOS ：查找bit数组中指定范围内第一个0或1出现的位置
+用户签到功能
+ /**
+     * 用户签到功能
+     *
+     * @return
+     */
+    @Override
+    public Result sign() {
+        //获取用户id
+        Long userId = UserHolder.getUser().getId();
+        if (userId == null) {
+            return Result.fail("你还没有登录");
+        }
+        //用户签到，在指定的bit位置中改写成1
+        //获取当前的年月
+        LocalDateTime now = LocalDateTime.now();
+        String yyyyMM = now.format(DateTimeFormatter.ofPattern("yyyyMM"));
+        String key = "sign:" + userId + ":" + yyyyMM;
+        //获取当月的第几号
+        int day = now.getDayOfMonth();
+        //写入Redis SETBIT key offset 1
+        stringRedisTemplate.opsForValue().setBit(key, day - 1, true);
+        return Result.ok();
+    }
+
+    /**
+     * @return
+     */
+    @Override
+    public Result signCount() {
+        // 1.获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.获取日期
+        LocalDateTime now = LocalDateTime.now();
+        // 3.拼接key
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = "sign:" + userId + keySuffix;
+        // 4.获取今天是本月的第几天
+        int dayOfMonth = now.getDayOfMonth();
+        // 5.获取本月截止今天为止的所有的签到记录，返回的是一个十进制的数字 BITFIELD sign:5:202203 GET u14 0
+        //14为本月的14日，0表示索引位置,u表示无符号
+        List<Long> bitList = stringRedisTemplate.opsForValue().bitField(
+                key,
+                BitFieldSubCommands.create().get(BitFieldSubCommands.BitFieldType.unsigned(dayOfMonth))
+                        .valueAt(0));
+        // oo11oo....
+        if (bitList == null || bitList.isEmpty()) {
+            return Result.ok(0);
+        }
+        Long num = bitList.get(0);
+        if (num == null || num == 0) {
+            return Result.ok(0);
+        }
+        int count = 0;
+        while (true) {
+            // 6.1.让这个数字与1做与运算，得到数字的最后一个bit位  // 判断这个bit位是否为0
+            if ((num & 1) == 0) {
+                // 如果为0，说明未签到，结束
+                break;
+            } else {
+                count++;
+            }
+//            无符号右移
+            num >>>= 1;
+        }
+        return Result.ok(count);
+    }
+
+* UV：全称Unique Visitor，也叫独立访客量，是指通过互联网访问、浏览这个网页的自然人。1天内同一个用户多次访问该网站，只记录1次。
+* PV：全称Page View，也叫页面访问量或点击量，用户每访问网站的一个页面，记录1次PV，用户多次打开页面，则记录多次PV。往往用来衡量网站的流量。
+redis:pfadd 添加，pfcount 统计，pfmerge 合并数据
+我们直接利用单元测试，向HyperLogLog中添加100万条数据，看看内存占用和统计效果如何
+String key = "data:key";
+        String[] values = new String[1000];
+        int index = 0;
+        for (int i = 1; i <= 1000000; i++) {
+            values[index++] = "user_" + i;
+            if (i % 1000 == 0) {
+                index = 0;
+                stringRedisTemplate.opsForHyperLogLog().add(key, values);
+            }
+        }
+        //统计数量
+        Long size = stringRedisTemplate.opsForHyperLogLog().size(key);
+        System.out.println("size=" + size);
